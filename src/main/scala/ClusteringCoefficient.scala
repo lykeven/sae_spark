@@ -1,145 +1,108 @@
 /**
-  * Created by wangyan on 16-7-25.
+  * Created by wangyan on 16-7-23.
   */
-import org.apache.spark.graphx.PartitionStrategy.RandomVertexCut
+
 import org.apache.spark.{SparkConf, SparkContext}
-import org.apache.spark.graphx._
+import org.apache.spark.SparkContext._
+import org.apache.spark.graphx.{VertexRDD, _}
+import org.apache.spark.graphx.PartitionStrategy.RandomVertexCut
+import org.apache.spark.rdd.RDD
 
 import scala.reflect.ClassTag
 
-/**
-  * Local clustering coefficient algorithm
-  *
-  * In a directed graph G=(V, E), we define the neighbourhood N_i of a vertex v_i as
-  * N_i={v_j: e_ij \in E or e_ji \in E}
-  *
-  * The local clustering coefficient C_i of a vertex v_i is then defined as
-  * C_i = |{e_jk: v_j, v_k \in N_i, e_jk \in E}| / (K_i * (K_i - 1))
-  * where K_i=|N_i| is the number of neighbors of v_i
-  *
-  * Note that the input graph must have been partitioned using
-  * [[org.apache.spark.graphx.Graph#partitionBy]].
-  */
 object ClusteringCoefficient {
-  /**
-    * Compute the local clustering coefficient for each vertex and
-    * return a graph with vertex value representing the local clustering coefficient of that vertex
-    *
-    * @param graph the graph for which to compute the connected components
-    *
-    * @return a graph with vertex attributes containing
-    *         the local clustering coefficient of that vertex
-    *
-    */
-  def run[VD: ClassTag, ED: ClassTag](graph: Graph[VD, ED]): Graph[Double, ED] = {
-    // Remove redundant edges
-    val g = graph.groupEdges((a, b) => a).cache()
+
+  def myCC [VD: ClassTag, ED: ClassTag](graph: Graph[VD,ED]): Graph[Double,ED] = {
+    val g = graph.groupEdges((a, b) => (a)).cache()
 
     // Construct map representations of the neighborhoods
     // key in the map: vertex ID of a neighbor
     // value in the map: number of edges between the vertex and the corresonding nighbor
-    val nbrSets: VertexRDD[Map[VertexId, Int]] =
-    g.collectNeighborIds(EdgeDirection.Either).mapValues { (vid, nbrs) =>
-      var nbMap = Map.empty[VertexId, Int]
-      var i = 0
-      while (i < nbrs.size) {
-        // prevent self cycle
-        val nbId = nbrs(i)
-        if(nbId != vid) {
-          val count = nbMap.getOrElse(nbId, 0)
-          nbMap += (nbId -> (count + 1))
-        }
-        i += 1
+    val nbrMaps: VertexRDD[Map[VertexId, Int]] =
+    g.collectNeighborIds(EdgeDirection.Either).mapValues { (vid, nodes) =>
+      var nMap = Map.empty[VertexId, Int]
+      for (i <- 0 to nodes.size-1) {
+        if (nodes(i) != vid)
+          nMap += (nodes(i) -> (nMap.getOrElse(nodes(i), 0) + 1))
       }
-      nbMap
+      nMap
     }
 
-    // join the sets with the graph
-    val setGraph: Graph[Map[VertexId, Int], ED] = g.outerJoinVertices(nbrSets) {
-      (vid, _, optSet) => optSet.getOrElse(null)
+    //graph with neighbor map
+    val graphNbr: Graph[Map[VertexId, Int], ED] =
+    g.outerJoinVertices(nbrMaps) { (vid, _, nbr) =>
+      nbr.getOrElse(null)
     }
 
-    // map function: for each edge (srcId = v_i, dstId = v_j),
-    // compute |{e_jk: e_ik, e_jk \in E, v_k \in V}| for vertex v_i
-    // and |{e_ik: e_ik, e_jk \in E, v_k \in V}| for vertex v_j
-    def edgeFunc(ctx: EdgeContext[Map[VertexId, Int], ED, Double]) {
-      assert(ctx.srcAttr != null)
-      assert(ctx.dstAttr != null)
-      // make sure srcId != dstId
-      if (ctx.srcId == ctx.dstId) {
-        return
+    //count triangle number for each vertices
+    def countFunc(ctx: EdgeContext[Map[VertexId, Int], ED, Double]) = {
+      if(ctx.srcId == ctx.dstId) {
+        ctx.sendToSrc(0)
+        ctx.sendToDst(0)
       }
-      // handle duplated edges
-      if ((ctx.srcAttr(ctx.dstId) == 2 && ctx.srcId > ctx.dstId) || (ctx.srcId == ctx.dstId)) {
-        return
-      }
-
-      val (smallId, largeId, smallMap, largeMap) = if (ctx.srcAttr.size < ctx.dstAttr.size) {
-        (ctx.srcId, ctx.dstId, ctx.srcAttr, ctx.dstAttr)
-      } else {
-        (ctx.dstId, ctx.srcId, ctx.dstAttr, ctx.srcAttr)
-      }
-      val iter = smallMap.iterator
-      var smallCount: Int = 0
-      var largeCount: Int = 0
-      while (iter.hasNext) {
-        val valPair = iter.next()
-        val vid = valPair._1
-        val smallVal = valPair._2
-        val largeVal = largeMap.getOrElse(vid, 0)
-        if (vid != ctx.srcId && vid != ctx.dstId && largeVal > 0) {
-          smallCount += largeVal
-          largeCount += smallVal
+      val (smallId, largeId , smallMap, largeMap) =
+        if(ctx.srcId > ctx.dstId) (ctx.srcId, ctx.dstId, ctx.srcAttr, ctx.dstAttr)
+        else (ctx.dstId, ctx.srcId, ctx.dstAttr, ctx.srcAttr)
+      var smallCount ,largeCount = 0
+      var iter = smallMap.iterator
+      while(iter.hasNext){
+        val element = iter.next()
+        val vid = element._1
+        val smallVal = element._2
+        val largeVal = largeMap.getOrElse(vid,0)
+        if(largeVal>0 && vid != ctx.srcId && vid != ctx.dstId){
+          smallCount += smallVal
+          largeCount += largeVal
         }
+
       }
-      if (ctx.srcId == smallId) {
+      if(smallId == ctx.srcId){
         ctx.sendToSrc(smallCount)
         ctx.sendToDst(largeCount)
-      } else {
-        ctx.sendToDst(smallCount)
+      }else{
         ctx.sendToSrc(largeCount)
+        ctx.sendToDst(smallCount)
       }
     }
 
-    // compute |{e_jk: v_j, v_k \in N_i, e_jk \in E}| for each vertex i
-    val counters: VertexRDD[Double] = setGraph.aggregateMessages(edgeFunc, _ + _)
-
-    // count number of neighbors for each vertex
-    var nbNumMap = Map[VertexId, Int]()
-    nbrSets.collect().foreach { case (vid, nbVal) =>
-      nbNumMap += (vid -> nbVal.size)
+    //number of neighbors
+    var nbrNum = Map[VertexId, Int]()
+    nbrMaps.collect().foreach { case (vid, nbVal) =>
+      nbrNum += (vid -> nbVal.size)
     }
 
-    // Merge counters with the graph
-    g.outerJoinVertices(counters) {
-      (vid, _, optCounter: Option[Double]) =>
-        val dblCount: Double = optCounter.getOrElse(0)
-        val nbNum = nbNumMap(vid)
-        assert((dblCount.toInt & 1) == 0)
-        if (nbNum > 1) {
-          dblCount / (2 * nbNum * (nbNum - 1))
-        }
-        else {
-          0
-        }
+    val counts: VertexRDD[Double] = graphNbr.aggregateMessages(countFunc, _ + _)
+
+    //combine cc with triangle and neighbor
+    val cc = g.outerJoinVertices(counts) { case (vid, _, optCounter: Option[Double]) =>
+      val dblCount: Double = optCounter.getOrElse(0)
+      val nbNum = nbrNum(vid)
+      if (nbNum > 1) {
+        dblCount / (2 * nbNum * (nbNum - 1))
+      }
+      else {
+        0
+      }
     }
+    return  cc
   }
 
-  def main(args: Array[String]): Unit ={
-    val conf = new SparkConf().setAppName("test app").setMaster("local")
+
+
+  def main(args: Array[String]): Unit = {
+
+    val conf = new SparkConf().setAppName("learn").setMaster("local")
     val sc = new SparkContext(conf)
 
     // build a triangle graph with duplicated edges
-    val edges = Array( 0L->1L, 1L->2L, 2L->0L )
-    val rawEdges = sc.parallelize(edges ++ edges, 2)
-    val graph = Graph.fromEdgeTuples(rawEdges, true, uniqueEdges = Some(RandomVertexCut)).cache()
-
-    // output results
-    val lcc = run(graph)
-    val verts = lcc.vertices
-    verts.collect.foreach { case (vid, count) =>
-      println(vid, count)
+    val edges = Array((0L, 1L), (1L, 2L), (2L, 0L))
+    val rawEdges = sc.parallelize(edges ++ edges)
+    val graph =Graph.fromEdgeTuples(rawEdges,true,uniqueEdges =Some(RandomVertexCut)).cache()
+    //output results
+    val ccs = myCC(graph)
+    ccs.vertices.foreach{case (vid, cc)=>
+      println(vid +" : " + cc)
     }
-    sc.stop()
+
   }
 }

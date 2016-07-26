@@ -15,6 +15,9 @@ object learn {
   def myCC [VD: ClassTag, ED: ClassTag](graph: Graph[VD,ED]): Graph[Double,ED] = {
     val g = graph.groupEdges((a, b) => (a)).cache()
 
+    // Construct map representations of the neighborhoods
+    // key in the map: vertex ID of a neighbor
+    // value in the map: number of edges between the vertex and the corresonding nighbor
     val nbrMaps: VertexRDD[Map[VertexId, Int]] =
       g.collectNeighborIds(EdgeDirection.Either).mapValues { (vid, nodes) =>
         var nMap = Map.empty[VertexId, Int]
@@ -25,11 +28,13 @@ object learn {
         nMap
       }
 
+    //graph with neighbor map
     val graphNbr: Graph[Map[VertexId, Int], ED] =
       g.outerJoinVertices(nbrMaps) { (vid, _, nbr) =>
         nbr.getOrElse(null)
       }
 
+    //count triangle number for each vertices
     def countFunc(ctx: EdgeContext[Map[VertexId, Int], ED, Double]) = {
       if(ctx.srcId == ctx.dstId) {
         ctx.sendToSrc(0)
@@ -60,6 +65,7 @@ object learn {
       }
     }
 
+    //number of neighbors
     var nbrNum = Map[VertexId, Int]()
     nbrMaps.collect().foreach { case (vid, nbVal) =>
       nbrNum += (vid -> nbVal.size)
@@ -67,6 +73,7 @@ object learn {
 
     val counts: VertexRDD[Double] = graphNbr.aggregateMessages(countFunc, _ + _)
 
+    //combine cc with triangle and neighbor
     val cc = g.outerJoinVertices(counts) { case (vid, _, optCounter: Option[Double]) =>
       val dblCount: Double = optCounter.getOrElse(0)
       val nbNum = nbrNum(vid)
@@ -87,9 +94,11 @@ object learn {
     val conf = new SparkConf().setAppName("learn").setMaster("local")
     val sc = new SparkContext(conf)
 
+    // build a triangle graph with duplicated edges
     val edges = Array((0L, 1L), (1L, 2L), (2L, 0L))
     val rawEdges = sc.parallelize(edges ++ edges)
     val graph =Graph.fromEdgeTuples(rawEdges,true,uniqueEdges =Some(RandomVertexCut)).cache()
+    //output results
     val ccs = myCC(graph)
     ccs.vertices.foreach{case (vid, cc)=>
       println(vid +" : " + cc)
